@@ -1,7 +1,7 @@
 from importlib.metadata import version
 
-from . import pl, pp, tl
+from . import pl, pp, preprocessing, tl, tools
 
-__all__ = ["pl", "pp", "tl"]
+__all__ = ["pl", "pp", "tl", "preprocessing", "tools"]
 
-__version__ = version("flowReg")
+from ._version import __version__
