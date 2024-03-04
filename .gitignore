@@ -26,3 +26,4 @@ __pycache__/
 # IDEs
 /.idea/
 /.vscode/
+/flowReg/.ipynb_checkpoints/
