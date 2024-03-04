@@ -1,7 +1,9 @@
 from importlib.metadata import version
 
-from . import pl, pp, preprocessing, tl, tools
+from . import preprocessing, processing, tools
 
-__all__ = ["pl", "pp", "tl", "preprocessing", "tools"]
+__all__ = ["processing", "preprocessing", "tools"]
 
-from ._version import __version__
+__author__ = "Farbod Chamanian"
+__email__ = "farbod.chamanian@helmholtz-munich.de"
+__version__ = "0.1.0"
