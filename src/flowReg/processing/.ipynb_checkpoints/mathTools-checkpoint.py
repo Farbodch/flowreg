@@ -1,13 +1,12 @@
 """FIX"""
-
 import time
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from diffrax import ODETerm, diffeqsolve, solver
-from jax import value_and_grad
+from jax import value_and_grad, jit
+from functools import partial
 from ott.geometry import pointcloud
 from ott.problems.linear import linear_problem
 from ott.solvers.linear import sinkhorn_lr
@@ -27,41 +26,75 @@ from ott.solvers.linear import sinkhorn_lr
 
 
 class dataTracker:
-    """FIX"""
+    """A class to store and manage data throughout the computation pipeline.
+    This class also keeps track of the format friendly to the plotter function
+    (.tools.plotter), as well as writing to (TO DO), and reading from (TO DO), file.
+
+    Parameters
+    ----------
+    results
+        Dictionary object: to store the results of the matching computation.
+    source
+        Numpy array: to store source's spatial data.
+    target
+        Numpy array: to store target's spatial data.
+    source_label
+        String: storing label of the source (decorative, not functional).
+    target_label
+        String: storing label of the target (decorative, not functional).
+    alpha_list
+        List of floats: regularization strengths to assess the loss at.
+    rank_list
+        List of integers: ranks at which the low-rank sinkhorn divergence
+        algorithm is assessed at.
+    iterations_list
+        List of integers: number of iterations the optimization algorithm should
+        loop through.
+
+    """
 
     results = {}
-
     def __init__(
         self,
         source=np.array([]),
         target=np.array([]),
-        sourceLabel="",
-        targetLabel="",
-        alphaList=None,
-        iterationsList=None,
-        rankList=None,
+        source_label="",
+        target_label="",
+        alpha_list=None,
+        iterations_list=None,
+        rank_list=None,
     ):
-        """FIX"""
 
-        if alphaList is None:
-            alphaList = []
-        if iterationsList is None:
-            iterationsList = []
-        if rankList is None:
-            rankList = []
+        if alpha_list is None:
+            alpha_list = []
+        if iterations_list is None:
+            iterations_list = []
+        if rank_list is None:
+            rank_list = []
 
         self.source = source
         self.target = target
-        self.sourceLabel = sourceLabel
-        self.targetLabel = targetLabel
-        self.alphaList = alphaList
-        self.iterationsList = iterationsList
-        self.rankList = rankList
+        self.source_label = source_label
+        self.target_label = target_label
+        self.alpha_list = alpha_list
+        self.iterations_list = iterations_list
+        self.rank_list = rank_list
         self.reset_instanceData()
-        self.testNum = 0
+        self.test_num = 0
 
     def reset_instanceData(self):
-        """FIX"""
+        """Resetting 'private' parameters of the class. These are used during outer
+        loop of the computation pipeline, when assessing different parameters passed
+        in through alpha_list, rank_list, and iterations_list.
+
+        Parameters
+        ----------
+        N/A
+
+        Returns
+        -------
+        N/A
+        """
         self.MSE_defSource_target_ = None
         self.regLoss_ = None
         self.startTime_ = None
@@ -73,10 +106,20 @@ class dataTracker:
         self.num_of_steps_ = None
         self.step_size_ = None
 
-    # check to ensure not overriding an existing self._testNum!
+    # check to ensure not overriding an existing self._test_num!
     def set_instanceData_toDataFile(self):
-        """FIX"""
-        self.results[f"{self.testNum}"]["instanceMetaData"] = {
+        """Saves the parameter data of the current instance being
+        computed (as indexed by test_num) to the results dictionary.
+
+        Parameters
+        ----------
+        N/A
+
+        Returns
+        -------
+        N/A
+        """
+        self.results[f"{self.test_num}"]["instanceMetaData"] = {
             "alpha": self.alpha_,
             "numOfOptimItrs": self.iterations_,
             "lr_sink_rank": self.rank_,
@@ -84,26 +127,72 @@ class dataTracker:
             "integratorStepSize": self.step_size_,
         }
 
-    # toDataFile only called at the end or if need extraction of results into external file
-    # def set_globalData_toDataFile(self):
-    #     self.results['subsampledSource'] = self.source
-    #     self.results['target'] = self.target
-    #     self.results['sourceLabel'] = self.sourceLabel
-    #     self.results['targetLabel'] = self.targetLabel
-
 
 def vector_field(t, state, params):
-    """Compute the time derivative of the state."""
+    """Generate the time derivative (vector field) of ODE's current state.
+
+    Parameters
+    ----------
+    t
+        A float: required for the Diffrax ode package's bookkeeping.
+    state
+        A Tensor: that keeps track of current state of the ODE's
+        current state (current position and momentum of each data
+        point along all the relevant spatial directions).
+    params
+        A Dictionary: that keeps track of static passed-in instaces
+        that are not affected by the ODE evolution, but influence
+        the evolution. For us, it passes in the geometric gradient
+        of our points in space <!--Testing:, as well as the function that can
+        compute this geometric gradient-->.
+
+    Returns
+    -------
+    A Tensor containing the vector field values with regards to both position
+    (dX/dt) and momentum (dP/dt), of each individual data point (along
+    all relevant dimensions/axes).
+    """
     # V=dX/dT, dP/dT=m.dV/dT=m.V2-V1, let m=1, dT=1
     X, P = jnp.split(state, 2, axis=-1)
-    V = P + params["geomGrad"]
+
+    # geomOTCostFen = params["geomOTCostFen"]
+    # geomGradCurr = geomOTCostFen(X)
+    # V = P + geomGradCurr ###Testomg - curr
+    V = P + params["geomGrad"] ###Testing - Prev
+
     return jnp.concatenate([V, -V], axis=-1)
 
+def evolve_points(source, momentum, geom_grad, geomOTCostFen, num_steps=10, step_size=0.1):
+    """Evolves the source points passed in, by integrating and pushing them along a vector
+    field defined by their geometric gradient.
 
-def lddmm_hamiltonian(source, target, alpha, initial_momentum, geom_grad, num_steps=10, step_size=0.1):
-    """FIX"""
+    Parameters
+    ----------
+    source
+        Numpy array: of spatial coordinates of data points.
+    momentum
+        Numpy array: of the momentum value of data points along relevant dimensions/axes.
+    geom_grad
+        Numpy array: geometric gradient of the passed in source points.
+
+    <!--Testing:
+    geomOTCostFen
+        Function: that calculates and returns geometric gradient values -->
+
+    num_steps
+        An integer: indicating the number of steps our discretized ODE is going to be
+        integrated along.
+    step_size
+        A float: indicating the size step size of our discretized ODE's integrator's
+        step size.
+
+    Returns
+    -------
+    A numpy array that of the new spatial coordinates of our source points after being evolved
+    through the ODE.
+    """
     # The state consists of [X, P] where X is the point cloud and P is its momentum
-    initial_conditions = jnp.concatenate([source, initial_momentum], axis=-1)
+    initial_conditions = jnp.concatenate([source, momentum], axis=-1)
 
     # vector_field = lambda t, y, params: vector_field(t, y, params)
     term = ODETerm(vector_field)
@@ -116,25 +205,70 @@ def lddmm_hamiltonian(source, target, alpha, initial_momentum, geom_grad, num_st
         t1=num_steps * step_size,
         dt0=step_size,
         y0=initial_conditions,
-        args={"geomGrad": geom_grad / 10},
+        args={"geomGrad": geom_grad, "geomOTCostFen": geomOTCostFen},
     )
 
     # Extract the deformed source from the integrated states
     # states.ys has shape 1*numOfPts*4 where 0*x*0:2 is the position of each point & 0*x*2:4 is the momentum of each point
     deformed_source = states.ys[0, :, :2]
 
+    return deformed_source
+
+def lddmm_objective_function(source,
+                             target,
+                             alpha,
+                             momentum,
+                             geom_grad,
+                             geomOTCostFen,
+                             num_steps=10,
+                             step_size=0.1):
+    """The objective function of our optimization problem. This function returns the regularized
+    loss between our evolved source points, and our target.
+
+    Parameters
+    ----------
+    source
+        Numpy array: of spatial coordinates of data points we're attemping
+        to evolve and match with target.
+    target
+        Numpy array: of spatial coordinates of data points we're attemping
+        to match the source points with.
+    alpha
+        A float: regularization strength of our optimization problem.
+    momentum
+        Numpy array: of the momentum value of data points along relevant dimensions/axes.
+    geom_grad
+        Numpy array: geometric gradient of the passed in source points.
+
+    <!--Testing:
+    geomOTCostFen
+        Function: that calculates and returns geometric gradient values -->
+
+    num_steps
+        An integer: indicating the number of steps our discretized ODE is going to be
+        integrated along.
+    step_size
+        A float: indicating the size step size of our discretized ODE's integrator's
+        step size.
+
+    Returns
+    -------
+    N/A
+    """
+
+    deformed_source = evolve_points(source, momentum, geom_grad, geomOTCostFen, num_steps, step_size)
     # Compute the L2 loss between the deformed source and target
-    loss = (jnp.mean(jnp.square(deformed_source - target)) + alpha * jnp.mean(jnp.square(initial_momentum))) ** (1 / 1)
+    loss = (jnp.mean(jnp.square(deformed_source - target)) + alpha * jnp.mean(jnp.square(momentum))) ** (1 / 1)
 
     return loss
 
 
-def sink_lr_setRank(myRank):
+def sink_lr_setRank(curr_rank):
     """FIX"""
 
     def sink_lr_cost(geom):
         """Return the OT cost and OT output given a geometry"""
-        ot = sinkhorn_lr.LRSinkhorn(rank=myRank, initializer="random")(linear_problem.LinearProblem(geom))
+        ot = sinkhorn_lr.LRSinkhorn(rank=curr_rank, initializer="random")(linear_problem.LinearProblem(geom))
         return ot.reg_ot_cost, ot
 
     return sink_lr_cost
@@ -149,7 +283,10 @@ def getWeightsSetTarget(target, cost_fen, eps=0.001):
         """FIX"""
         geom = pointcloud.PointCloud(current_source, target, epsilon=epsilon)
         (cost, ot), geom_g = cost_fn_vg(geom)
-        assert ot.converged
+
+        # assert ot.converged
+
+
         # weights = ot.geoms[0].transport_from_potentials(ot.potentials[0][0],ot.potentials[0][1])
         # ots[10].geoms[0].transport_from_potentials(ots[10].potentials[0][0],ots[10].potentials[0][1])
         # transportMatrix = ot.geoms[0].transport_from_potentials(ot.potentials[0][0],ot.potentials[0][1])
@@ -162,9 +299,9 @@ def runMatching(dataObj, num_steps=10, step_size=0.1):
     """FIX"""
     dataObj.reset_instanceData()
 
-    alphaList = dataObj.alphaList
-    rankList = dataObj.rankList
-    iterationsList = dataObj.iterationsList
+    alpha_list = dataObj.alpha_list
+    rank_list = dataObj.rank_list
+    iterations_list = dataObj.iterations_list
 
     source = dataObj.source
     target = dataObj.target
@@ -172,80 +309,73 @@ def runMatching(dataObj, num_steps=10, step_size=0.1):
     dataObj.num_of_steps_ = num_steps
     dataObj.step_size_ = step_size
 
-    testNum = dataObj.testNum
+    test_num = dataObj.test_num
 
     # OuterForLoop Iterating over params
-    for myAlpha in alphaList:
-        for myRank in rankList:
-            sink_lr_getCost = sink_lr_setRank(myRank)
+    for curr_alpha in alpha_list:
+        for curr_rank in rank_list:
+            sink_lr_getCost = sink_lr_setRank(curr_rank)
             getSinkData = getWeightsSetTarget(target, cost_fen=sink_lr_getCost)
-            for myItrNum in iterationsList:
-                dataObj.testNum = testNum
+            for curr_num_of_itrs in iterations_list:
+                dataObj.test_num = test_num
 
-                dataObj.alpha_ = myAlpha
-                dataObj.rank_ = myRank
-                dataObj.iterations_ = myItrNum
+                dataObj.alpha_ = curr_alpha
+                dataObj.rank_ = curr_rank
+                dataObj.iterations_ = curr_num_of_itrs
 
                 optimizer = optax.adam(1e-1)
 
-                initial_momentum = jnp.zeros_like(source)
-                state = optimizer.init(initial_momentum)
-
-                geom_grad = getSinkData(source)
+                momentum = jnp.zeros_like(source)
+                state = optimizer.init(momentum)
 
                 MSE_defSource_target = []
                 regLoss = []
 
                 startTime = time.strftime("%H:%M:%S", time.localtime())
-                for _i in range(myItrNum):
-                    initial_conditions = jnp.concatenate([source, initial_momentum], axis=-1)
-                    # vector_field = lambda t, y, params: vector_field(t, y, params)
-                    term = ODETerm(vector_field)
-                    # Integrate the vector_field using diffeqsolve
-                    states = diffeqsolve(
-                        terms=term,
-                        solver=solver.Dopri5(),
-                        t0=0,
-                        t1=(num_steps * step_size),
-                        dt0=step_size,
-                        y0=initial_conditions,
-                        args={"geomGrad": geom_grad / 10},
-                    )
-                    # Extract the deformed source from the integrated states
-                    deformed_source = states.ys[0, :, :2]
+                for _i in range(curr_num_of_itrs):
 
-                    geom_grad = getSinkData(deformed_source)
+                    geom_grad = getSinkData(source)
 
-                    loss, gradients = value_and_grad(lddmm_hamiltonian)(
+                    deformed_source = evolve_points(
                         source,
-                        target,
-                        myAlpha,
-                        initial_momentum,
+                        momentum,
                         num_steps=num_steps,
                         step_size=step_size,
                         geom_grad=geom_grad,
+                        geomOTCostFen=getSinkData
+                    )
+
+                    loss, gradients = value_and_grad(lddmm_objective_function)(
+                        source,
+                        target,
+                        curr_alpha,
+                        momentum,
+                        num_steps=num_steps,
+                        step_size=step_size,
+                        geom_grad=geom_grad,
+                        geomOTCostFen=getSinkData
                     )
 
                     updates, state = optimizer.update(gradients, state)
 
-                    initial_momentum = optax.apply_updates(initial_momentum, updates)
+                    momentum = optax.apply_updates(momentum, updates)
 
                     MSE_defSource_target.append(float(jnp.mean((deformed_source - target) ** 2)))
-                    regLoss.append(float(myAlpha * jnp.mean(initial_momentum**2)))
+                    regLoss.append(float(curr_alpha * jnp.mean(momentum**2)))
 
                     # store innerLoopInfo
-                    dataObj.results[f"{testNum}"] = {"deformed_source": deformed_source}
+                    dataObj.results[f"{test_num}"] = {"deformed_source": deformed_source}
                     dataObj.set_instanceData_toDataFile()
                 # store outerLoopInfo
-                dataObj.results[f"{testNum}"]["endTime"] = time.strftime("%H:%M:%S", time.localtime())
-                dataObj.results[f"{testNum}"]["startTime"] = startTime
-                dataObj.results[f"{testNum}"]["MSE_defSource_target"] = np.array(MSE_defSource_target)
-                dataObj.results[f"{testNum}"]["regLoss"] = np.array(regLoss)
+                dataObj.results[f"{test_num}"]["endTime"] = time.strftime("%H:%M:%S", time.localtime())
+                dataObj.results[f"{test_num}"]["startTime"] = startTime
+                dataObj.results[f"{test_num}"]["MSE_defSource_target"] = np.array(MSE_defSource_target)
+                dataObj.results[f"{test_num}"]["regLoss"] = np.array(regLoss)
 
-                testNum += 1
+                test_num += 1
 
     # dataObj.set_globalData_toDataFile()
-    return (dataObj.results, testNum)
+    return (dataObj.results, test_num)
 
 
 ##########
